@@ -28,7 +28,7 @@ absl.flags.DEFINE_string("dir_dataset", "../datasets/", "Directory where dataset
 absl.flags.DEFINE_integer("num_images", 20, "Number of wrong-prediction examples to analyze")
 absl.flags.DEFINE_integer("min_abs_index", 20, "Only use examples whose absolute dataset index is >= this value")
 absl.flags.DEFINE_integer("memory_set_size", 100, "Number of memory samples in each custom memory set")
-absl.flags.DEFINE_integer("max_random_trials", 200, "Max number of random memory sets to try per wrong prediction")
+absl.flags.DEFINE_integer("recycle_top_k", 20, "Number of top-weight original memory samples to keep in recycling strategy")
 absl.flags.DEFINE_integer("seed", 42, "Random seed")
 absl.flags.mark_flag_as_required("path_model")
 
@@ -106,8 +106,8 @@ def build_memory_tensor_from_indices(all_memory_images, indices, device):
     return memory_tensor
 
 
-def sample_true_class_memory(class_to_indices, true_label, memory_set_size, rng):
-    indices = class_to_indices[int(true_label)]
+def sample_predicted_class_memory(class_to_indices, predicted_label, memory_set_size, rng):
+    indices = class_to_indices[int(predicted_label)]
     if len(indices) >= memory_set_size:
         chosen = rng.sample(indices, memory_set_size)
     else:
@@ -115,10 +115,63 @@ def sample_true_class_memory(class_to_indices, true_label, memory_set_size, rng)
     return chosen
 
 
-def sample_random_memory(total_memory_size, memory_set_size, rng):
-    if total_memory_size >= memory_set_size:
-        return rng.sample(range(total_memory_size), memory_set_size)
-    return [rng.randrange(total_memory_size) for _ in range(memory_set_size)]
+def sample_balanced_fallback_memory(class_to_indices, memory_set_size, rng):
+    """
+    Build a fallback memory set spread across all classes.
+    """
+    classes = sorted(class_to_indices.keys())
+    num_classes = len(classes)
+    per_class = max(1, memory_set_size // num_classes)
+
+    chosen = []
+    for c in classes:
+        indices = class_to_indices[c]
+        if len(indices) >= per_class:
+            chosen.extend(rng.sample(indices, per_class))
+        else:
+            chosen.extend(rng.choice(indices) for _ in range(per_class))
+
+    while len(chosen) < memory_set_size:
+        c = rng.choice(classes)
+        chosen.append(rng.choice(class_to_indices[c]))
+
+    if len(chosen) > memory_set_size:
+        chosen = chosen[:memory_set_size]
+
+    return chosen
+
+
+def build_top_weight_recycled_memory(
+    original_memory_batch,
+    sorted_idx_row,
+    mem_val_row,
+    class_to_indices,
+    all_memory_images,
+    device,
+    memory_set_size,
+    recycle_top_k,
+    rng
+):
+    """
+    Keep the top positively weighted samples from the original memory batch,
+    then fill the rest with a balanced fallback memory set from the full memory dataset.
+    """
+    positive_sorted = sorted_idx_row[mem_val_row > 0].detach().cpu().tolist()
+    keep_local = positive_sorted[:recycle_top_k]
+
+    kept_tensors = [original_memory_batch[i].detach().cpu() for i in keep_local]
+
+    num_needed = max(0, memory_set_size - len(kept_tensors))
+    fallback_indices = sample_balanced_fallback_memory(class_to_indices, num_needed, rng) if num_needed > 0 else []
+    fallback_tensors = [all_memory_images[i] for i in fallback_indices]
+
+    combined = kept_tensors + fallback_tensors
+
+    # If there were more kept samples than memory_set_size, trim.
+    combined = combined[:memory_set_size]
+
+    memory_tensor = torch.stack(combined, dim=0).to(device)
+    return memory_tensor
 
 
 def make_memory_grid(memory_tensor, weights_row, sorted_idx_row, undo_normalization_fn):
@@ -238,11 +291,10 @@ def run(path: str, dataset_dir: str):
 
     memory_dataset = mem_loader.dataset
     all_memory_images, all_memory_labels, class_to_indices = collect_memory_by_class(memory_dataset)
-    total_memory_size = len(all_memory_images)
 
     dir_save = os.path.join(
         "..", "images", "mem_images", dataset_name, modality,
-        checkpoint["model_name"], "memory_set_analysis"
+        checkpoint["model_name"], "strategy_analysis"
     )
     os.makedirs(dir_save, exist_ok=True)
 
@@ -284,10 +336,10 @@ def run(path: str, dataset_dir: str):
                     break
 
                 true_label = int(labels[ind].item())
-                pred_label = int(predictions[ind].item())
+                original_pred = int(predictions[ind].item())
                 abs_idx = int(abs_indices[ind])
 
-                if pred_label == true_label:
+                if original_pred == true_label:
                     continue
 
                 if abs_idx < FLAGS.min_abs_index:
@@ -316,7 +368,7 @@ def run(path: str, dataset_dir: str):
                     input_image=input_selected,
                     abs_idx=abs_idx,
                     true_label=true_label,
-                    pred_label=pred_label,
+                    pred_label=original_pred,
                     class_names=class_names,
                     mem_img=original_mem_img,
                     title_prefix="Original Memory Batch",
@@ -324,107 +376,100 @@ def run(path: str, dataset_dir: str):
                 )
 
                 # -------------------------------------------------
-                # 2) TRUE-CLASS-ONLY MEMORY SET
+                # 2) PREDICTED-CLASS-ONLY MEMORY
                 # -------------------------------------------------
-                true_class_indices = sample_true_class_memory(
+                predicted_class_indices = sample_predicted_class_memory(
                     class_to_indices,
-                    true_label,
+                    original_pred,
                     FLAGS.memory_set_size,
                     rng
                 )
-                true_class_memory = build_memory_tensor_from_indices(
+                predicted_class_memory = build_memory_tensor_from_indices(
                     all_memory_images,
-                    true_class_indices,
+                    predicted_class_indices,
                     device
                 )
 
-                tc_pred, tc_rw_row, tc_mem_val_row, tc_sorted_idx_row = evaluate_single_image(
+                pc_pred, pc_rw_row, pc_mem_val_row, pc_sorted_idx_row = evaluate_single_image(
                     model,
                     input_selected,
-                    true_class_memory
+                    predicted_class_memory
                 )
 
-                true_class_mem_img = make_memory_grid(
-                    true_class_memory,
-                    tc_mem_val_row,
-                    tc_sorted_idx_row,
+                predicted_class_mem_img = make_memory_grid(
+                    predicted_class_memory,
+                    pc_mem_val_row,
+                    pc_sorted_idx_row,
                     undo_normalization
                 )
 
                 save_result_figure(
-                    save_path=os.path.join(sample_dir, "true_class_only.png"),
+                    save_path=os.path.join(sample_dir, "predicted_class_only.png"),
                     input_image=input_selected,
                     abs_idx=abs_idx,
                     true_label=true_label,
-                    pred_label=tc_pred,
+                    pred_label=pc_pred,
                     class_names=class_names,
-                    mem_img=true_class_mem_img,
-                    title_prefix="True-Class-Only Memory",
+                    mem_img=predicted_class_mem_img,
+                    title_prefix="Predicted-Class-Only Memory",
                     undo_normalization_fn=undo_normalization
                 )
 
                 # -------------------------------------------------
-                # 3) RANDOM MEMORY SETS UNTIL CORRECTION
+                # 3) TOP-WEIGHT MEMORY RECYCLING
                 # -------------------------------------------------
-                random_fixed = False
-                random_fixed_trial = -1
-                random_fixed_pred = -1
+                recycled_memory = build_top_weight_recycled_memory(
+                    original_memory_batch=default_memory_batch,
+                    sorted_idx_row=memory_sorted_index[ind],
+                    mem_val_row=mem_val[ind],
+                    class_to_indices=class_to_indices,
+                    all_memory_images=all_memory_images,
+                    device=device,
+                    memory_set_size=FLAGS.memory_set_size,
+                    recycle_top_k=FLAGS.recycle_top_k,
+                    rng=rng
+                )
 
-                for trial in range(1, FLAGS.max_random_trials + 1):
-                    rand_indices = sample_random_memory(
-                        total_memory_size,
-                        FLAGS.memory_set_size,
-                        rng
-                    )
-                    rand_memory = build_memory_tensor_from_indices(
-                        all_memory_images,
-                        rand_indices,
-                        device
-                    )
+                tw_pred, tw_rw_row, tw_mem_val_row, tw_sorted_idx_row = evaluate_single_image(
+                    model,
+                    input_selected,
+                    recycled_memory
+                )
 
-                    rand_pred, rand_rw_row, rand_mem_val_row, rand_sorted_idx_row = evaluate_single_image(
-                        model,
-                        input_selected,
-                        rand_memory
-                    )
+                recycled_mem_img = make_memory_grid(
+                    recycled_memory,
+                    tw_mem_val_row,
+                    tw_sorted_idx_row,
+                    undo_normalization
+                )
 
-                    if rand_pred == true_label:
-                        random_fixed = True
-                        random_fixed_trial = trial
-                        random_fixed_pred = rand_pred
-
-                        rand_mem_img = make_memory_grid(
-                            rand_memory,
-                            rand_mem_val_row,
-                            rand_sorted_idx_row,
-                            undo_normalization
-                        )
-
-                        save_result_figure(
-                            save_path=os.path.join(sample_dir, "random_fix_trial_{:03d}.png".format(trial)),
-                            input_image=input_selected,
-                            abs_idx=abs_idx,
-                            true_label=true_label,
-                            pred_label=rand_pred,
-                            class_names=class_names,
-                            mem_img=rand_mem_img,
-                            title_prefix="Random Memory Set (first correcting trial {})".format(trial),
-                            undo_normalization_fn=undo_normalization
-                        )
-                        break
+                save_result_figure(
+                    save_path=os.path.join(sample_dir, "top_weight_recycling.png"),
+                    input_image=input_selected,
+                    abs_idx=abs_idx,
+                    true_label=true_label,
+                    pred_label=tw_pred,
+                    class_names=class_names,
+                    mem_img=recycled_mem_img,
+                    title_prefix="Top-Weight Memory Recycling",
+                    undo_normalization_fn=undo_normalization
+                )
 
                 rows.append({
                     "wrong_example_id": saved_count,
                     "abs_idx": abs_idx,
                     "true_label": true_label,
                     "true_class_name": class_names[true_label],
-                    "original_pred": pred_label,
-                    "original_pred_name": class_names[pred_label],
-                    "true_class_only_pred": tc_pred,
-                    "true_class_only_corrected": int(tc_pred == true_label),
-                    "random_correcting_set_found": int(random_fixed),
-                    "random_correcting_trial": random_fixed_trial,
-                    "random_correcting_pred": random_fixed_pred
+                    "original_pred": original_pred,
+                    "original_pred_name": class_names[original_pred],
+
+                    "predicted_class_only_pred": pc_pred,
+                    "predicted_class_only_changed": int(pc_pred != original_pred),
+                    "predicted_class_only_corrected": int(pc_pred == true_label),
+
+                    "top_weight_recycling_pred": tw_pred,
+                    "top_weight_recycling_changed": int(tw_pred != original_pred),
+                    "top_weight_recycling_corrected": int(tw_pred == true_label),
                 })
 
                 saved_count += 1
@@ -432,20 +477,23 @@ def run(path: str, dataset_dir: str):
 
     print()
 
+    fieldnames = [
+        "wrong_example_id",
+        "abs_idx",
+        "true_label",
+        "true_class_name",
+        "original_pred",
+        "original_pred_name",
+        "predicted_class_only_pred",
+        "predicted_class_only_changed",
+        "predicted_class_only_corrected",
+        "top_weight_recycling_pred",
+        "top_weight_recycling_changed",
+        "top_weight_recycling_corrected",
+    ]
+
     with open(summary_csv, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()) if rows else [
-            "wrong_example_id",
-            "abs_idx",
-            "true_label",
-            "true_class_name",
-            "original_pred",
-            "original_pred_name",
-            "true_class_only_pred",
-            "true_class_only_corrected",
-            "random_correcting_set_found",
-            "random_correcting_trial",
-            "random_correcting_pred",
-        ])
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         for row in rows:
             writer.writerow(row)
@@ -453,11 +501,15 @@ def run(path: str, dataset_dir: str):
     print("Done. Saved analysis to {}".format(dir_save))
 
     if rows:
-        tc_fixed = sum(int(r["true_class_only_corrected"]) for r in rows)
-        rand_fixed = sum(int(r["random_correcting_set_found"]) for r in rows)
+        pc_changed = sum(int(r["predicted_class_only_changed"]) for r in rows)
+        pc_corrected = sum(int(r["predicted_class_only_corrected"]) for r in rows)
+        tw_changed = sum(int(r["top_weight_recycling_changed"]) for r in rows)
+        tw_corrected = sum(int(r["top_weight_recycling_corrected"]) for r in rows)
 
-        print("True-class-only corrected: {}/{}".format(tc_fixed, len(rows)))
-        print("Random correcting sets found: {}/{}".format(rand_fixed, len(rows)))
+        print("Predicted-class-only changed: {}/{}".format(pc_changed, len(rows)))
+        print("Predicted-class-only corrected: {}/{}".format(pc_corrected, len(rows)))
+        print("Top-weight recycling changed: {}/{}".format(tw_changed, len(rows)))
+        print("Top-weight recycling corrected: {}/{}".format(tw_corrected, len(rows)))
     else:
         print("No qualifying wrong predictions found.")
 
