@@ -115,28 +115,26 @@ def sample_predicted_class_memory(class_to_indices, predicted_label, memory_set_
     return chosen
 
 
-def sample_balanced_fallback_memory(class_to_indices, memory_set_size, rng):
+def sample_balanced_memory(class_to_indices, memory_set_size, rng):
     """
-    Build a fallback memory set spread across all classes.
+    Sample a memory set with approximately equal samples from each class.
     """
     classes = sorted(class_to_indices.keys())
     num_classes = len(classes)
-    per_class = max(1, memory_set_size // num_classes)
+
+    base = memory_set_size // num_classes
+    remainder = memory_set_size % num_classes
 
     chosen = []
-    for c in classes:
+
+    for i, c in enumerate(classes):
+        take = base + (1 if i < remainder else 0)
         indices = class_to_indices[c]
-        if len(indices) >= per_class:
-            chosen.extend(rng.sample(indices, per_class))
+
+        if len(indices) >= take:
+            chosen.extend(rng.sample(indices, take))
         else:
-            chosen.extend(rng.choice(indices) for _ in range(per_class))
-
-    while len(chosen) < memory_set_size:
-        c = rng.choice(classes)
-        chosen.append(rng.choice(class_to_indices[c]))
-
-    if len(chosen) > memory_set_size:
-        chosen = chosen[:memory_set_size]
+            chosen.extend(rng.choice(indices) for _ in range(take))
 
     return chosen
 
@@ -162,12 +160,10 @@ def build_top_weight_recycled_memory(
     kept_tensors = [original_memory_batch[i].detach().cpu() for i in keep_local]
 
     num_needed = max(0, memory_set_size - len(kept_tensors))
-    fallback_indices = sample_balanced_fallback_memory(class_to_indices, num_needed, rng) if num_needed > 0 else []
+    fallback_indices = sample_balanced_memory(class_to_indices, num_needed, rng) if num_needed > 0 else []
     fallback_tensors = [all_memory_images[i] for i in fallback_indices]
 
     combined = kept_tensors + fallback_tensors
-
-    # If there were more kept samples than memory_set_size, trim.
     combined = combined[:memory_set_size]
 
     memory_tensor = torch.stack(combined, dim=0).to(device)
@@ -416,7 +412,46 @@ def run(path: str, dataset_dir: str):
                 )
 
                 # -------------------------------------------------
-                # 3) TOP-WEIGHT MEMORY RECYCLING
+                # 3) BALANCED PER-CLASS MEMORY
+                # -------------------------------------------------
+                balanced_indices = sample_balanced_memory(
+                    class_to_indices,
+                    FLAGS.memory_set_size,
+                    rng
+                )
+                balanced_memory = build_memory_tensor_from_indices(
+                    all_memory_images,
+                    balanced_indices,
+                    device
+                )
+
+                bal_pred, bal_rw_row, bal_mem_val_row, bal_sorted_idx_row = evaluate_single_image(
+                    model,
+                    input_selected,
+                    balanced_memory
+                )
+
+                balanced_mem_img = make_memory_grid(
+                    balanced_memory,
+                    bal_mem_val_row,
+                    bal_sorted_idx_row,
+                    undo_normalization
+                )
+
+                save_result_figure(
+                    save_path=os.path.join(sample_dir, "balanced_per_class.png"),
+                    input_image=input_selected,
+                    abs_idx=abs_idx,
+                    true_label=true_label,
+                    pred_label=bal_pred,
+                    class_names=class_names,
+                    mem_img=balanced_mem_img,
+                    title_prefix="Balanced Per-Class Memory",
+                    undo_normalization_fn=undo_normalization
+                )
+
+                # -------------------------------------------------
+                # 4) TOP-WEIGHT MEMORY RECYCLING
                 # -------------------------------------------------
                 recycled_memory = build_top_weight_recycled_memory(
                     original_memory_batch=default_memory_batch,
@@ -467,6 +502,10 @@ def run(path: str, dataset_dir: str):
                     "predicted_class_only_changed": int(pc_pred != original_pred),
                     "predicted_class_only_corrected": int(pc_pred == true_label),
 
+                    "balanced_per_class_pred": bal_pred,
+                    "balanced_per_class_changed": int(bal_pred != original_pred),
+                    "balanced_per_class_corrected": int(bal_pred == true_label),
+
                     "top_weight_recycling_pred": tw_pred,
                     "top_weight_recycling_changed": int(tw_pred != original_pred),
                     "top_weight_recycling_corrected": int(tw_pred == true_label),
@@ -487,6 +526,9 @@ def run(path: str, dataset_dir: str):
         "predicted_class_only_pred",
         "predicted_class_only_changed",
         "predicted_class_only_corrected",
+        "balanced_per_class_pred",
+        "balanced_per_class_changed",
+        "balanced_per_class_corrected",
         "top_weight_recycling_pred",
         "top_weight_recycling_changed",
         "top_weight_recycling_corrected",
@@ -503,11 +545,17 @@ def run(path: str, dataset_dir: str):
     if rows:
         pc_changed = sum(int(r["predicted_class_only_changed"]) for r in rows)
         pc_corrected = sum(int(r["predicted_class_only_corrected"]) for r in rows)
+
+        bal_changed = sum(int(r["balanced_per_class_changed"]) for r in rows)
+        bal_corrected = sum(int(r["balanced_per_class_corrected"]) for r in rows)
+
         tw_changed = sum(int(r["top_weight_recycling_changed"]) for r in rows)
         tw_corrected = sum(int(r["top_weight_recycling_corrected"]) for r in rows)
 
         print("Predicted-class-only changed: {}/{}".format(pc_changed, len(rows)))
         print("Predicted-class-only corrected: {}/{}".format(pc_corrected, len(rows)))
+        print("Balanced per-class changed: {}/{}".format(bal_changed, len(rows)))
+        print("Balanced per-class corrected: {}/{}".format(bal_corrected, len(rows)))
         print("Top-weight recycling changed: {}/{}".format(tw_changed, len(rows)))
         print("Top-weight recycling corrected: {}/{}".format(tw_corrected, len(rows)))
     else:
