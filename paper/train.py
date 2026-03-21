@@ -2,7 +2,7 @@ import os
 import pickle
 import random
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import absl.app
 import absl.flags
@@ -20,62 +20,25 @@ absl.flags.DEFINE_integer("log_interval", 100, "Log interval between prints duri
 absl.flags.DEFINE_string(
     "memory_strategy",
     "default",
-    "Memory strategy for memory-based models: default or balanced"
+    "Memory strategy for memory-based models: default, balanced, or top_weight"
 )
 absl.flags.mark_flag_as_required("modality")
 FLAGS = absl.flags.FLAGS
 
 
-def _extract_labels_from_dataset(dataset) -> Optional[np.ndarray]:
+def _build_class_index_map(dataset) -> Dict[int, List[int]]:
     """
-    Try to recover labels from a dataset or nested Subset dataset.
-
-    This is written defensively because torchvision datasets / subsets often store
-    labels in slightly different places: labels, targets, or inside nested .dataset.
+    Build a mapping {class_id: [dataset_indices]} by iterating directly over
+    the dataset. This is robust to nested Subset objects.
     """
-    current = dataset
-
-    # Unwrap nested torch.utils.data.Subset objects while remembering indices
-    collected_indices = None
-    while hasattr(current, "indices") and hasattr(current, "dataset"):
-        subset_indices = np.array(current.indices)
-        if collected_indices is None:
-            collected_indices = subset_indices
-        else:
-            collected_indices = collected_indices[subset_indices]
-        current = current.dataset
-
-    labels = None
-    for attr in ["labels", "targets"]:
-        if hasattr(current, attr):
-            labels = getattr(current, attr)
-            break
-
-    if labels is None:
-        return None
-
-    labels = np.array(labels)
-
-    if collected_indices is not None:
-        labels = labels[collected_indices]
-
-    return labels
-
-
-def _build_class_index_map(dataset) -> Optional[Dict[int, List[int]]]:
-    """
-    Build a mapping {class_id: [dataset_indices]} for the memory dataset.
-    Returns None if labels cannot be recovered.
-    """
-    labels = _extract_labels_from_dataset(dataset)
-    if labels is None:
-        return None
-
     class_to_indices: Dict[int, List[int]] = {}
-    unique_classes = np.unique(labels)
 
-    for cls in unique_classes:
-        class_to_indices[int(cls)] = np.where(labels == cls)[0].tolist()
+    for idx in range(len(dataset)):
+        _, label = dataset[idx]
+        label = int(label)
+        if label not in class_to_indices:
+            class_to_indices[label] = []
+        class_to_indices[label].append(idx)
 
     return class_to_indices
 
@@ -88,10 +51,6 @@ def _sample_balanced_memory_batch(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Sample a memory batch that is as balanced as possible across classes.
-
-    If batch_size is not divisible by num_classes, the remainder is distributed
-    by giving one extra sample to the first few classes in a shuffled class order.
-    Sampling is done with replacement when a class has too few samples.
     """
     classes = list(class_to_indices.keys())
     random.shuffle(classes)
@@ -112,12 +71,58 @@ def _sample_balanced_memory_batch(
         if len(cls_indices) == 0:
             continue
 
-        # sample with replacement if needed
         replace = len(cls_indices) < num_to_sample
         chosen = np.random.choice(cls_indices, size=num_to_sample, replace=replace)
         sampled_indices.extend(chosen.tolist())
 
-    # Shuffle the final sampled set so the batch is not class-blocked
+    random.shuffle(sampled_indices)
+
+    batch_imgs = []
+    batch_labels = []
+    for idx in sampled_indices:
+        img, label = dataset[idx]
+        batch_imgs.append(img)
+        batch_labels.append(label)
+
+    memory_input = torch.stack(batch_imgs).to(device)
+    memory_labels = torch.tensor(batch_labels, device=device)
+
+    return memory_input, memory_labels
+
+
+def _build_top_weight_pool(
+    dataset,
+    fraction: float = 0.5
+) -> List[int]:
+    """
+    Approximation of a top-weight recycling strategy:
+    keep only a fixed subset of the memory dataset and reuse it more often.
+
+    Since train.py does not expose internal memory weights directly, this
+    implements the idea by repeatedly sampling from a reduced memory pool.
+    """
+    total = len(dataset)
+    keep = max(1, int(total * fraction))
+    all_indices = list(range(total))
+    random.shuffle(all_indices)
+    return all_indices[:keep]
+
+
+def _sample_from_index_pool(
+    dataset,
+    index_pool: List[int],
+    batch_size: int,
+    device: torch.device
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Sample a batch from a specified pool of dataset indices.
+    Sampling uses replacement if needed.
+    """
+    if len(index_pool) == 0:
+        raise ValueError("Index pool is empty for memory sampling.")
+
+    replace = len(index_pool) < batch_size
+    sampled_indices = np.random.choice(index_pool, size=batch_size, replace=replace).tolist()
     random.shuffle(sampled_indices)
 
     batch_imgs = []
@@ -172,16 +177,20 @@ def train_memory_model(
     model.train()
     scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
 
-    # Prepare memory strategy
-    use_balanced_memory = FLAGS.memory_strategy.lower() == "balanced"
+    strategy = FLAGS.memory_strategy.lower()
+    use_balanced_memory = strategy == "balanced"
+    use_top_weight_memory = strategy == "top_weight"
 
     class_to_indices = None
+    top_weight_pool = None
+
     if use_balanced_memory:
         class_to_indices = _build_class_index_map(mem_loader.dataset)
-        if class_to_indices is None:
-            print("[WARNING] Could not recover class labels from mem_loader.dataset.")
-            print("[WARNING] Falling back to default memory sampling.")
-            use_balanced_memory = False
+
+    if use_top_weight_memory:
+        # Recycle a smaller fixed portion of the memory pool.
+        # 50% is a simple approximation of "top memory weight recycling".
+        top_weight_pool = _build_top_weight_pool(mem_loader.dataset, fraction=0.5)
 
     mem_iterator = iter(mem_loader)
 
@@ -189,16 +198,22 @@ def train_memory_model(
         for batch_idx, (data, y) in enumerate(train_loader):
             optimizer.zero_grad()
 
-            # input
             data = data.to(device)
             y = y.to(device)
 
-            # memory input
+            batch_size = mem_loader.batch_size if mem_loader.batch_size is not None else len(y)
+
             if use_balanced_memory:
-                batch_size = mem_loader.batch_size if mem_loader.batch_size is not None else len(y)
                 memory_input, _ = _sample_balanced_memory_batch(
                     dataset=mem_loader.dataset,
                     class_to_indices=class_to_indices,
+                    batch_size=batch_size,
+                    device=device
+                )
+            elif use_top_weight_memory:
+                memory_input, _ = _sample_from_index_pool(
+                    dataset=mem_loader.dataset,
+                    index_pool=top_weight_pool,
                     batch_size=batch_size,
                     device=device
                 )
@@ -207,7 +222,6 @@ def train_memory_model(
                     mem_loader, mem_iterator, device
                 )
 
-            # perform training step
             with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
                 outputs = model(data, memory_input)
                 loss = loss_criterion(outputs, y)
@@ -216,7 +230,6 @@ def train_memory_model(
             scaler.step(optimizer)
             scaler.update()
 
-            # log stuff
             if batch_idx % FLAGS.log_interval == 0:
                 print(
                     "Train Epoch: {} [({:.0f}%({})]\t".format(
@@ -227,7 +240,7 @@ def train_memory_model(
                     end="\r"
                 )
 
-        scheduler.step()  # increase scheduler step for each epoch
+        scheduler.step()
 
     return model
 
@@ -284,26 +297,27 @@ def run_experiment(config: dict, modality: str):
     print("Device:{}".format(device))
     print("Memory strategy: {}".format(FLAGS.memory_strategy))
 
-    # get dataset info
     dataset_name = config["dataset_name"]
     num_classes = config[dataset_name]["num_classes"]
 
-    # training parameters
     loss_criterion = torch.nn.CrossEntropyLoss()
 
-    # saving/loading stuff
     save = config["save"]
-    path_saving_model = 'models/{}/{}/{}/{}/{}/'.format(
+
+    strategy_name = (
+        FLAGS.memory_strategy if modality in ["memory", "encoder_memory"] else "std"
+    )
+    path_saving_model = "models/{}/{}/{}/{}/{}/".format(
         dataset_name,
         FLAGS.modality,
-        FLAGS.memory_strategy if FLAGS.modality in ['memory', 'encoder_memory'] else 'std',
-        config['model'],
-        config['train_examples']
+        strategy_name,
+        config["model"],
+        config["train_examples"]
     )
+
     if save and not os.path.isdir(path_saving_model):
         os.makedirs(path_saving_model)
 
-    # optimizer parameters
     learning_rate = float(config["optimizer"]["learning_rate"])
     weight_decay = float(config["optimizer"]["weight_decay"])
     nesterov = bool(config["optimizer"]["nesterov"])
@@ -345,10 +359,8 @@ def run_experiment(config: dict, modality: str):
                 milestones=opt_milestones
             )
 
-        # get dataset
         train_loader, _, test_loader, mem_loader = utils.get_loaders(config, run)
 
-        # training process
         if modality == "memory" or modality == "encoder_memory":
             model = train_memory_model(
                 model,
@@ -362,8 +374,6 @@ def run_experiment(config: dict, modality: str):
             train_time = time.time()
 
             cum_acc = []
-
-            # perform 5 times the validation to stabilize results
             init_eval_time = time.time()
             for _ in range(5):
                 best_acc, best_loss = utils.eval_memory(
@@ -388,10 +398,8 @@ def run_experiment(config: dict, modality: str):
             best_acc, best_loss = utils.eval_std(model, test_loader, loss_criterion, device)
             end_eval_time = time.time()
 
-        # stats
         run_acc.append(best_acc)
 
-        # save
         if save and path_saving_model:
             saved_name = "{}.pt".format(run + 1)
             save_path = os.path.join(path_saving_model, saved_name)
@@ -411,7 +419,6 @@ def run_experiment(config: dict, modality: str):
             info = {"run_num": run + 1, "accuracies": run_acc}
             pickle.dump(info, open(path_saving_model + "conf.p", "wb"))
 
-        # log
         print(
             "Run:{} | Best Loss:{:.4f} | Accuracy {:.2f} | Mean Accuracy:{:.2f} | Std Dev Accuracy:{:.2f}\tT:{:.2f}min\tE:{:.2f}".format(
                 run + 1,
